@@ -26,8 +26,21 @@ from .mmaudio.ext.autoencoder import AutoEncoderModule
 from open_clip import CLIP
 
 import logging
+import torch.nn.functional as F
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
+
+def resample_video(video: torch.Tensor, new_frames: int) -> torch.Tensor:
+    if video.shape[0] == new_frames:
+        return video
+    # video: [t, h, w, c]
+    # To [1, c, t, h, w]
+    video = video.permute(3, 0, 1, 2).unsqueeze(0)  # [1, c, t, h, w]
+    # Interpolate temporally
+    video = F.interpolate(video, size=(new_frames, video.shape[3], video.shape[4]), mode='trilinear', align_corners=False)
+    # Back to [t, h, w, c]
+    video = video.squeeze(0).permute(1, 2, 3, 0)
+    return video
 
 def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tuple[torch.Tensor, torch.Tensor, float]:
     _CLIP_SIZE = 384
@@ -57,41 +70,17 @@ def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tup
     clip_frames_count = int(_CLIP_FPS * duration_sec)
     sync_frames_count = int(_SYNC_FPS * duration_sec)
 
-    # Adjust duration if there are not enough frames
-    if total_frames < clip_frames_count:
-        log.warning(f'Clip video is too short: {total_frames / _CLIP_FPS:.2f} < {duration_sec:.2f}')
-        clip_frames_count = total_frames
-        duration_sec = total_frames / _CLIP_FPS
+    # Resample to required frame counts
+    clip_video_tensor = resample_video(video_tensor, clip_frames_count)
+    sync_video_tensor = resample_video(video_tensor, sync_frames_count)
 
-    if total_frames < sync_frames_count:
-        log.warning(f'Sync video is too short: {total_frames / _SYNC_FPS:.2f} < {duration_sec:.2f}, truncating to {total_frames / _SYNC_FPS:.2f} sec')
-        sync_frames_count = total_frames
-        duration_sec = total_frames / _SYNC_FPS
-
-    clip_frames = video_tensor[:clip_frames_count]
-    sync_frames = video_tensor[:sync_frames_count]
-
-    clip_frames = clip_frames.permute(0, 3, 1, 2)
-    sync_frames = sync_frames.permute(0, 3, 1, 2)
+    clip_frames = clip_video_tensor.permute(0, 3, 1, 2)
+    sync_frames = sync_video_tensor.permute(0, 3, 1, 2)
 
     clip_frames = torch.stack([clip_transform(frame) for frame in clip_frames])
     sync_frames = torch.stack([sync_transform(frame) for frame in sync_frames])
 
-    clip_length_sec = clip_frames.shape[0] / _CLIP_FPS
-    sync_length_sec = sync_frames.shape[0] / _SYNC_FPS
-
-    # if clip_length_sec < duration_sec:
-    #     log.warning(f'Clip video is too short: {clip_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {clip_length_sec:.2f} sec')
-    #     duration_sec = clip_length_sec
-
-    # if sync_length_sec < duration_sec:
-    #     log.warning(f'Sync video is too short: {sync_length_sec:.2f} < {duration_sec:.2f}')
-    #     log.warning(f'Truncating to {sync_length_sec:.2f} sec')
-    #     duration_sec = sync_length_sec
-
-    clip_frames = clip_frames[:int(_CLIP_FPS * duration_sec)]
-    sync_frames = sync_frames[:int(_SYNC_FPS * duration_sec)]
+    # No need to truncate duration, as we resampled to match
 
     return clip_frames, sync_frames, duration_sec
 
